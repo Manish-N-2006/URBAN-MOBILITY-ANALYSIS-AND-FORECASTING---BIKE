@@ -147,66 +147,247 @@ The dashboard is structured into **7 dedicated tabs**. Below is the complete cat
 
 ## 🔬 Mathematical Formulations & Methodologies
 
-### 1. Zone Demand Risk Scoring Engine
+---
 
-The platform implements an interpretable, scenario-based composite operational risk score bounded strictly within $[0, 100]$:
+### 1. Zone Demand Risk Scoring Engine (0 to 100)
 
-$$\text{Shortage Ratio} = \frac{\max(\text{Forecast Demand} - \text{Estimated Capacity}, 0)}{\max(\text{Forecast Demand}, 1)}$$
+#### Intuition & Purpose
+Fleet managers need a single, explainable metric to answer: *"Which urban zones face the most dangerous supply-demand imbalance tomorrow?"* Rather than using an uninterpretable machine-learning score, the platform calculates a deterministic, composite risk score bounded strictly within $[0, 100]$.
 
-$$\text{Risk Score} = 100 \times \left(0.70 \times \text{Shortage Ratio} + 0.20 \times \text{Normalized Growth} + 0.10 \times \text{Normalized Volatility}\right)$$
+#### The Master Risk Equation
 
-Where:
-* **Estimated Capacity**:
-  $$\text{Estimated Capacity} = \text{Virtual Driver Count} \times \text{Rides Served per Driver per Interval}$$
-* **Normalized Recent Growth**: Mapped smoothly into $[0, 1]$ over historical 14-day trends:
-  $$\text{Normalized Growth} = \frac{\min(1.0, \max(-0.5, \text{Growth Rate})) + 0.5}{1.5} \in [0, 1]$$
-* **Normalized Historical Volatility**: Coefficient of variation ($CV = \frac{\sigma}{\mu}$) mapped into $[0, 1]$:
-  $$\text{Normalized Volatility} = \frac{\min(1.2, \max(0.0, CV))}{1.2} \in [0, 1]$$
+$$
+\text{Risk Score} = 100 \times \left( 0.70 \cdot \text{Shortage Ratio} + 0.20 \cdot \text{Normalized Growth} + 0.10 \cdot \text{Normalized Volatility} \right)
+$$
 
-#### Risk Tier Classifications
-* **Low Risk ($0 \le \text{Score} \le 30$)**: Capacity easily absorbs demand; surplus driver buffer exists.
-* **Moderate Risk ($30 < \text{Score} \le 60$)**: Capacity buffer is narrow; peak intervals may experience minor dispatch delays.
-* **High Risk ($60 < \text{Score} \le 80$)**: Significant capacity deficit; elevated surge pricing and cancellations expected.
-* **Critical Shortage ($80 < \text{Score} \le 100$)**: Acute driver shortfall; severe unserved passenger demand requiring fleet reallocation.
+The final score is strictly clamped to ensure physical validity:
+
+$$
+\text{Final Risk Score} = \min\left(100, \, \max\left(0, \, \text{Round}(\text{Risk Score}, \, 1)\right)\right)
+$$
 
 ---
 
-### 2. Time-Series Forecasting & Evaluation
+#### Component 1: Capacity Shortage Ratio (70% Weight)
+Quantifies what percentage of passenger ride demand cannot be fulfilled by the active driver fleet:
 
-#### Continuous Daily Panel Generation
-Raw ride timestamps are aggregated into a daily time series for each urban zone:
-$$Y_z = \{y_{z, t}\}_{t=1}^T \quad \text{for } t \in [2024\text{-}06\text{-}17, 2024\text{-}08\text{-}16]$$
-Days with zero observed requests are imputed with $0$ rather than dropped, preserving the strict 61-day temporal continuity required by ARIMA models.
+$$
+\text{Estimated Capacity} = \text{Virtual Drivers} \times \text{Rides Served per Driver per Day}
+$$
 
-#### Chronological Split vs. Random Split
+$$
+\text{Capacity Shortage} = \max\left( \text{Forecast Demand} - \text{Estimated Capacity}, \; 0 \right)
+$$
+
+$$
+\text{Shortage Ratio} = \frac{\text{Capacity Shortage}}{\max\left( \text{Forecast Demand}, \; 1 \right)} \in [0, 1]
+$$
+
+> **Why the max terms?**
+> * $\max(\dots, 0)$ prevents surplus capacity from creating negative shortage.
+> * $\max(\dots, 1)$ prevents division-by-zero errors when forecast demand is zero.
+
+---
+
+#### Component 2: Normalized Recent Growth (20% Weight)
+Captures demand surge momentum over the preceding 14-day window. Growth is clamped between $-50\%$ and $+100\%$ and mapped linearly into $[0, 1]$:
+
+$$
+\text{Clamped Growth} = \max\left( -0.50, \; \min\left( 1.00, \; \text{Observed Growth Rate} \right) \right)
+$$
+
+$$
+\text{Normalized Growth} = \frac{\text{Clamped Growth} + 0.50}{1.50} \in [0, 1]
+$$
+
+* If demand contracted by $\ge 50\%$: $\text{Normalized Growth} = 0.0$ (lowest growth strain).
+* If demand remained static ($0\%$ growth): $\text{Normalized Growth} = \frac{0 + 0.5}{1.5} \approx 0.333$.
+* If demand surged by $\ge 100\%$: $\text{Normalized Growth} = 1.0$ (maximum growth strain).
+
+---
+
+#### Component 3: Normalized Historical Volatility (10% Weight)
+Measures dispatch unpredictability using the Coefficient of Variation ($CV = \frac{\sigma}{\mu}$), where higher variance demands higher contingency buffers:
+
+$$
+CV = \frac{\sigma_{\text{historical}}}{\mu_{\text{historical}}} = \frac{\text{Standard Deviation of Daily Demand}}{\text{Mean Daily Demand}}
+$$
+
+$$
+\text{Clamped } CV = \max\left( 0.0, \; \min\left( 1.20, \; CV \right) \right)
+$$
+
+$$
+\text{Normalized Volatility} = \frac{\text{Clamped } CV}{1.20} \in [0, 1]
+$$
+
+---
+
+#### Complete Variable Dictionary
+
+| Symbol / Parameter | Code Variable | Default | Valid Range | Physical Description |
+| :--- | :--- | :---: | :---: | :--- |
+| $\hat{Y}_z$ | `forecast_demand` | *Zone Forecast* | $[0, \infty)$ rides/day | Projected daily ride booking requests for zone $z$. |
+| $D_z$ | `virtual_driver_count` | 5 drivers | $[0, \infty)$ drivers | Active bike-taxi drivers assigned to zone $z$. |
+| $\kappa$ | `rides_per_driver` | 6 rides/day | $(0, 24]$ rides | Realistic completed trips a single driver serves daily. |
+| $C_z = D_z \cdot \kappa$ | `estimated_capacity` | $5 \times 6 = 30$ | $[0, \infty)$ rides/day | Total ride serving capacity in zone $z$. |
+| $S_z$ | `capacity_shortage` | $\max(\hat{Y}_z - C_z, 0)$ | $[0, \infty)$ rides | Unmet passenger requests facing cancellation or delays. |
+| $SR_z$ | `shortage_ratio` | $S_z / \max(\hat{Y}_z, 1)$ | $[0, 1]$ ratio | Proportion of total demand that goes unserved. |
+| $g_z$ | `recent_growth_rate` | 0.00 (flat) | $[-0.5, +1.0]$ | 14-day demand acceleration: $\frac{\bar{y}_{\text{recent}} - \bar{y}_{\text{prior}}}{\bar{y}_{\text{prior}}}$. |
+| $CV_z$ | `historical_cv` | 0.25 | $[0.0, 1.2]$ | Ratio of demand standard deviation to mean ($\sigma / \mu$). |
+
+---
+
+#### Step-by-Step Calculation Example with Real Numbers
+
+Consider **Koramangala** during an evening peak deficit scenario:
+* **Forecast Demand**: $\hat{Y} = 19.0 \text{ rides/day}$
+* **Virtual Drivers**: $D = 1 \text{ driver}$
+* **Rides per Driver**: $\kappa = 6 \text{ rides/driver/day}$
+* **Recent Growth**: $g = +0.10 \text{ (+10% growth)}$
+* **Volatility**: $CV = 0.30$
+
+$$\begin{aligned}
+\text{1. Estimated Capacity} &= 1 \times 6 = \mathbf{6.0 \text{ rides}} \\
+\text{2. Shortage} &= \max(19.0 - 6.0, \; 0) = \mathbf{13.0 \text{ unserved rides}} \\
+\text{3. Shortage Ratio} &= \frac{13.0}{\max(19.0, 1)} = \mathbf{0.6842} \\
+\text{4. Normalized Growth} &= \frac{0.10 + 0.50}{1.50} = \frac{0.60}{1.50} = \mathbf{0.4000} \\
+\text{5. Normalized Volatility} &= \frac{0.30}{1.20} = \mathbf{0.2500}
+\end{aligned}$$
+
+Now, compute the weighted point contributions:
+
+$$\begin{aligned}
+\text{Shortage Points} &= 100 \times 0.70 \times 0.6842 = \mathbf{47.9 \text{ pts}} \\
+\text{Growth Points} &= 100 \times 0.20 \times 0.4000 = \mathbf{8.0 \text{ pts}} \\
+\text{Volatility Points} &= 100 \times 0.10 \times 0.2500 = \mathbf{2.5 \text{ pts}} \\
+\hline
+\mathbf{\text{Total Risk Score}} &= 47.9 + 8.0 + 2.5 = \mathbf{58.4 \text{ pts}} \quad \text{(Tier: Moderate Risk / Elevated Strain)}
+\end{aligned}$$
+
+---
+
+#### Risk Tier Classifications & Operational Protocols
+
+| Tier Name | Score Range | Badge Color | Operational Diagnosis | Prescribed Fleet Action |
+| :--- | :---: | :---: | :--- | :--- |
+| **Low Risk** | $0 \le \text{Score} \le 30$ | `#22c55e` (Green) | Capacity comfortably absorbs demand; surplus driver buffer exists. | Eligible to serve as **Donor Zone** in reallocation. |
+| **Moderate Risk** | $30 < \text{Score} \le 60$ | `#eab308` (Yellow) | Capacity buffer is narrow; minor dispatch delays during peak hours. | Monitor dispatch queues; maintain assigned drivers. |
+| **High Risk** | $60 < \text{Score} \le 80$ | `#f97316` (Orange) | Significant driver deficit; surge pricing & cancellations elevated. | Primary candidate for driver transfers from low-risk zones. |
+| **Critical Shortage** | $80 < \text{Score} \le 100$ | `#ef4444` (Red) | Severe capacity shortfall; acute unserved passenger volume. | Urgent: Dispatch virtual fleet reallocations immediately. |
+
+---
+
+### 2. Time-Series Forecasting & Chronological Validation
+
+#### Continuous Daily Panel Formulation
+For each canonical zone $z \in \{1, \dots, 145\}$, daily request counts are aggregated into an unbroken temporal sequence:
+
+$$
+Y_z = \left[ y_{z, 1}, \, y_{z, 2}, \, \dots, \, y_{z, T} \right] \quad \text{for } t = 1, \dots, 61 \quad (\text{June 17 to August 16, 2024})
+$$
+
+Days with zero ride requests are explicitly imputed with $y_{z, t} = 0$ rather than dropped, preserving the strict 61-day temporal continuity required by ARIMA difference operators.
+
+---
+
+#### Chronological Validation Split (Leak-Free Protocol)
+To ensure honest out-of-sample benchmarking, the platform strictly enforces chronological time-series splitting:
+
 ```
-Chronological Validation (Strictly Preserves Temporal Ordering):
-[================== Training Set (~54 Days) ==================][=== Test Set (7 Days) ===]
-                                                                ▲ Evaluated here (Zero Leakage)
-
-Random Splitting (BANNED — Causes Future-to-Past Leakage):
-[== Train ==][ Test ][== Train ==][ Test ][======= Train =======][ Test ][== Train ==]
+Full Historical Time-Series (T = 61 Calendar Days):
+[===================== Training Set (54 Days) =====================][=== Holdout Test Set (7 Days) ===]
+ June 17, 2024 ──────────────────────────────────────── August 9, 2024 │ August 10, 2024 ───── August 16, 2024
+                                                                       ▲ Evaluated Here (Zero Data Leakage)
 ```
 
-#### Evaluation Metrics
-Out-of-sample performance is quantified on the 7-day unseen historical holdout window:
+$$\text{Training Set: } t \in \{1, \dots, T - H\} \quad \text{where } T = 61, \; H = 7$$
+
+$$\text{Test Holdout: } t \in \{T - H + 1, \dots, T\} \quad (\text{final 7 consecutive days})$$
+
+---
+
+#### Models Evaluated
+
+1. **Seasonal Naive Benchmark (`snaive`)**:
+   Projects demand forward based strictly on the matching day-of-week from 7 days prior:
+   $$\hat{y}_{T-H+h}^{\text{snaive}} = y_{(T-H+h) - 7}$$
+
+2. **Seasonal Auto-ARIMA Model ($(p, d, q) \times (P, D, Q)_7$)**:
+   Selects optimal autoregressive, differencing, and moving average orders under weekly periodicity ($s = 7$):
+   $$\Phi(B^7) \, \phi(B) \, (1 - B^7)^D \, (1 - B)^d \, y_t = \Theta(B^7) \, \theta(B) \, \epsilon_t$$
+   Where $B$ is the backshift operator ($B^k y_t = y_{t-k}$), and $\epsilon_t \sim \mathcal{WN}(0, \sigma^2)$ is white noise error.
+
+---
+
+#### Out-of-Sample Evaluation Metrics
+
+On the unseen 7-day holdout set, empirical error metrics are calculated as follows:
+
 * **Mean Absolute Error (MAE)**:
-  $$\text{MAE} = \frac{1}{H} \sum_{h=1}^H |y_{T-H+h} - \hat{y}_{T-H+h}|$$
-* **Root Mean Squared Error (RMSE)**:
-  $$\text{RMSE} = \sqrt{\frac{1}{H} \sum_{h=1}^H (y_{T-H+h} - \hat{y}_{T-H+h})^2}$$
-* **Mean Absolute Percentage Error (MAPE)**:
-  $$\text{MAPE} = \frac{100}{H} \sum_{h=1}^H \left|\frac{y_{T-H+h} - \hat{y}_{T-H+h}}{y_{T-H+h}}\right| \quad (\text{evaluated on } y > 0)$$
+  Measures the average error magnitude in exact daily ride units:
+  $$\text{MAE} = \frac{1}{H} \sum_{h=1}^{H} \left| y_{T-H+h} - \hat{y}_{T-H+h} \right|$$
 
-#### Predictive Modeling & Uncertainty Intervals
-Full historical series are fit using Seasonal Auto-ARIMA ($(p,d,q)(P,D,Q)_7$) or Exponential Smoothing (ETS). Predictions are bounded physically by non-negativity:
-$$\hat{y}_{T+h} = \max(0, \text{Point Forecast})$$
-$$\text{Lower Band}_{80/95} = \max(0, \text{Lower CI})$$
+* **Root Mean Squared Error (RMSE)**:
+  Penalizes large forecast spikes and outlier days heavily:
+  $$\text{RMSE} = \sqrt{\frac{1}{H} \sum_{h=1}^{H} \left( y_{T-H+h} - \hat{y}_{T-H+h} \right)^2}$$
+
+* **Mean Absolute Percentage Error (MAPE)**:
+  Measures percentage error across days with non-zero observed demand:
+  $$\text{MAPE} = \frac{100\%}{H^*} \sum_{\substack{h=1 \\ y_{T-H+h} > 0}}^{H} \left| \frac{y_{T-H+h} - \hat{y}_{T-H+h}}{y_{T-H+h}} \right| \quad \text{where } H^* = \sum_{h=1}^H \mathbf{1}_{\{y_{T-H+h} > 0\}}$$
 
 ---
 
-### 3. What-If Driver Allocation Simulator: Step-by-Step Guide
+#### Physical Non-Negativity Bounding
+Because passenger demand and prediction interval lower bounds cannot be negative in the physical world, all model outputs are truncated at zero:
 
-The simulator allows fleet managers and urban planners to test reallocation interventions before executing them in the field.
+$$\hat{y}_{T+h}^{\text{physical}} = \max\left(0, \; \hat{y}_{T+h}\right)$$
+
+$$\text{Lower Band}_{80/95}^{\text{physical}} = \max\left(0, \; \text{Lower CI}_{80/95}\right)$$
+
+---
+
+### 3. Invariant-Preserving "What-If" Simulator Formulation
+
+The simulator models policy interventions where a fleet manager reallocates $\Delta D$ virtual drivers from a **Donor Zone** ($A$) to a **Recipient Zone** ($B$).
+
+#### 1. Conservation of Fleet Supply Invariant
+The total driver supply across both zones must remain strictly constant before and after the intervention:
+
+$$
+S_{\text{total}} = D_A^{\text{initial}} + D_B^{\text{initial}} \equiv D_A^{\text{post}} + D_B^{\text{post}}
+$$
+
+#### 2. Reallocation Transfer Rules & Physical Bounds
+
+$$
+D_A^{\text{post}} = D_A^{\text{initial}} - \Delta D \quad \text{subject to } 0 \le \Delta D \le D_A^{\text{initial}}
+$$
+
+$$
+D_B^{\text{post}} = D_B^{\text{initial}} + \Delta D \quad \text{subject to } \Delta D \ge 0
+$$
+
+> **Physical Constraint**: The platform physically disallows transferring more drivers than the donor zone possesses ($\Delta D \le D_A^{\text{initial}}$), ensuring $D_A^{\text{post}} \ge 0$.
+
+#### 3. Post-Transfer Capacity & Deficit Impact
+
+$$\begin{aligned}
+\text{Capacity}_A^{\text{post}} &= D_A^{\text{post}} \times \kappa \\
+\text{Capacity}_B^{\text{post}} &= D_B^{\text{post}} \times \kappa \\
+\text{Shortage}_B^{\text{post}} &= \max\left(\hat{Y}_B - \text{Capacity}_B^{\text{post}}, \; 0\right)
+\end{aligned}$$
+
+#### 4. Systemic Net Benefit Metrics
+
+* **Unserved Rides Eliminated**:
+  $$\Delta \text{Unserved Demand} = \text{Shortage}_B^{\text{initial}} - \text{Shortage}_B^{\text{post}} \ge 0$$
+
+* **Recipient Risk Points Mitigated**:
+  $$\Delta \text{Risk}_B = \text{Risk Score}_B^{\text{post}} - \text{Risk Score}_B^{\text{initial}} < 0 \quad (\text{Risk reduced})$$
+
+* **Donor Risk Tradeoff**:
+  $$\Delta \text{Risk}_A = \text{Risk Score}_A^{\text{post}} - \text{Risk Score}_A^{\text{initial}} \ge 0 \quad (\text{Tradeoff tracked})$$
 
 ```
 ┌─────────────────────────────────┐                 ┌─────────────────────────────────┐
